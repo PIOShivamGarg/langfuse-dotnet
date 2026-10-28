@@ -1,0 +1,23 @@
+# ---- Secrets: never commit ----
+appsettings.Local.json
+appsettings.*.Local.json
+*.local.json
+.env
+*.env
+
+# ---- Build output ----
+bin/
+obj/
+
+# ---- OpenTelemetry self-diagnostics ----
+OTEL_DIAGNOSTICS.json
+*.exe.*.log
+
+# ---- IDE / OS ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
