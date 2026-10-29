@@ -22,17 +22,22 @@ Both land in Langfuse under one trace per garment, and one session per run.
 
 ## Configuration
 
-**Nothing is committed.** There is a single settings file, `appsettings.Local.json`, and it
-is gitignored. Two layers, the second overriding the first:
+**No credentials are committed.** Settings live in one gitignored file, with a committed
+template beside it — the same relationship `.env` and `.env.example` have:
 
-| Layer | File / source | Committed? | Use for |
-|---|---|---|---|
-| 1 | `appsettings.Local.json` | **no** (gitignored) | Every setting, local dev |
-| 2 | Environment variables | n/a | CI and production |
+| File / source | Committed? | Use for |
+|---|---|---|
+| `appsettings.Local.example.json` | yes | Template: every key, placeholder secrets |
+| `appsettings.Local.json` | **no** (gitignored) | The real file you run with |
+| Environment variables | n/a | CI and production; override the file |
 
-Because no template is committed, **this section is the reference for the key set** — a fresh
-clone has no `appsettings.json` to copy. Create `appsettings.Local.json` next to the
-`.csproj` with all of the following:
+Start by copying the template:
+
+```bash
+cp appsettings.Local.example.json appsettings.Local.json
+```
+
+Then replace the placeholder values. The full key set:
 
 ```json
 {
@@ -79,8 +84,12 @@ clone has no `appsettings.json` to copy. Create `appsettings.Local.json` next to
 The image resource is **separate** from any chat deployment — `gpt-image-*` models have
 their own endpoint and key.
 
-The file is optional at load time, so an environment-variable-only deployment still runs.
-Anything genuinely missing is reported by name at startup.
+`appsettings.Local.json` is optional at load time, so an environment-variable-only
+deployment still runs. Anything genuinely missing is reported by name at startup.
+
+When you add a setting, add it to `appsettings.Local.example.json` too — blank or
+placeholder if it is a secret — so the template stays a complete picture of what the app
+needs.
 
 ### Environment variables
 
