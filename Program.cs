@@ -1,10 +1,7 @@
 ﻿using System.Diagnostics;
-using System.Net.Http.Headers;
 using System.Text;
-using System.Text.Json;
-using Azure;
-using Azure.AI.OpenAI;
-using Microsoft.Extensions.AI;
+using LangfuseDemo.Imaging;
+using LangfuseDemo.Langfuse;
 using Microsoft.Extensions.Configuration;
 using OpenTelemetry;
 using OpenTelemetry.Exporter;
@@ -12,121 +9,159 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
 // =====================================================================================
-//  1. SETTINGS  (loaded from appsettings.json - no credentials live in this file)
+//  WHAT THIS DOES
 // =====================================================================================
-// Three layers, each overriding the one before it:
-//   1. appsettings.json        - committed template, secrets blank
-//   2. appsettings.Local.json  - your real keys, gitignored, optional
-//   3. environment variables   - wins over both; use this in CI/production
-//                                e.g. Langfuse__SecretKey, AzureAIFoundry__ApiKey
-//                                ('__' is the separator for the ':' in a config path)
+// For each garment product photo:
+//   1. front shot - product photo        + front prompt -> photorealistic model, front view
+//   2. back shot  - product photo + (1)  + back prompt  -> the same model, seen from behind
+//
+// Both prompts live in Langfuse Prompt Management, and every call lands in Langfuse as a
+// generation whose input and output carry the actual images, not just text.
+//
+// Usage:  dotnet run                 -> the default garment
+//         dotnet run -- AR101A       -> one named garment
+//         dotnet run -- --all        -> every garment in Garments:Images
+
+
+// =====================================================================================
+//  1. SETTINGS
+// =====================================================================================
+// Two layers, the second overriding the first:
+//   1. appsettings.Local.json  - every setting lives here; gitignored, never committed
+//   2. environment variables   - wins over the file; use this in CI/production
+//                                e.g. Langfuse__SecretKey, AzureOpenAIImage__ApiKey
+//
+// There is deliberately no committed appsettings.json. The file is optional so an
+// environment-variable-only deployment still runs; anything genuinely missing is reported
+// by name at startup, one key at a time. README.md lists the full key set.
 
 IConfiguration config = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
-    .AddJsonFile("appsettings.json", optional: false)
     .AddJsonFile("appsettings.Local.json", optional: true)
     .AddEnvironmentVariables()
     .Build();
 
-// Fails fast with an actionable message instead of a confusing 401 later on.
 string Required(string key) =>
     config[key] is { Length: > 0 } value
         ? value
         : throw new InvalidOperationException(
-            $"Missing configuration '{key}'. Set it in appsettings.Local.json or as the "
-            + $"environment variable '{key.Replace(":", "__")}'. See README.md.");
+            $"Missing configuration '{key}'. Set it in appsettings.Local.json (create it "
+            + $"from the key list in README.md) or as the environment variable "
+            + $"'{key.Replace(":", "__")}'.");
+
+// The image settings also accept the flat AZURE_* environment variable names, so an
+// existing .env-style setup works without being rewritten into the nested shape.
+//
+// Precedence, highest first - an environment variable in EITHER spelling beats the file,
+// which is the same rule the rest of the config follows. Reading the environment directly
+// is what keeps that true: config[...] cannot tell a file value from an env one, so
+// checking the nested path first would silently let the file win over AZURE_OPENAI_*.
+string ImageSetting(string key, string flatEnvName, string? fallback = null) =>
+    Environment.GetEnvironmentVariable($"AzureOpenAIImage__{key}") is { Length: > 0 } nestedEnv ? nestedEnv
+    : Environment.GetEnvironmentVariable(flatEnvName) is { Length: > 0 } flatEnv ? flatEnv
+    : config[$"AzureOpenAIImage:{key}"] is { Length: > 0 } fromFile ? fromFile
+    : fallback
+      ?? throw new InvalidOperationException(
+          $"Missing configuration 'AzureOpenAIImage:{key}'. Set it in appsettings.Local.json, "
+          + $"or as the environment variable '{flatEnvName}'. See README.md.");
 
 // --- Langfuse (self-hosted) ----------------------------------------------------------
 string langfuseBaseUrl   = Required("Langfuse:BaseUrl");
 string langfusePublicKey = Required("Langfuse:PublicKey");
 string langfuseSecretKey = Required("Langfuse:SecretKey");
-
-// Where OpenTelemetry pushes the finished traces.
 string langfuseOtelEndpoint = langfuseBaseUrl.TrimEnd('/') + "/api/public/otel/v1/traces";
 
 // --- Langfuse Prompt Management --------------------------------------------------------
-// The prompt text lives in Langfuse, not in this file. Langfuse keeps every edit as a new
-// immutable version number, and the "production" label points at the version this app
-// should run. Changing the wording means editing it in the Langfuse UI - no redeploy.
-string promptName  = Required("Langfuse:PromptName");
-string promptLabel = Required("Langfuse:PromptLabel");
-
-// Leave true to push the seed template below into Langfuse the first time you run against
-// an empty instance (creates version 1). Afterwards it is a no-op; manage the prompt in the
-// Langfuse UI, where each save becomes version 2, 3, ...
+string frontPromptName = Required("Langfuse:FrontPromptName");
+string backPromptName  = Required("Langfuse:BackPromptName");
+string promptLabel     = Required("Langfuse:PromptLabel");
 bool seedPromptIfMissing = bool.TryParse(config["Langfuse:SeedPromptIfMissing"], out var seed) && seed;
 
-// --- Azure AI Foundry -------------------------------------------------------------------
-string foundryEndpoint = Required("AzureAIFoundry:Endpoint");
-string foundryKey      = Required("AzureAIFoundry:ApiKey");
-string deploymentName  = Required("AzureAIFoundry:DeploymentName");
+// --- Azure OpenAI image resource -------------------------------------------------------
+// A separate resource from the chat deployment: the gpt-image-* models have their own
+// endpoint and key, which is why these do not reuse the AzureAIFoundry settings.
+string imageEndpoint   = ImageSetting("Endpoint",   "AZURE_OPENAI_ENDPOINT");
+string imageApiKey     = ImageSetting("ApiKey",     "AZURE_OPENAI_API_KEY");
+string imageApiVersion = ImageSetting("ApiVersion", "AZURE_OPENAI_API_VERSION");
+string imageDeployment = ImageSetting("Deployment", "AZURE_IMAGE_DEPLOYMENT");
+string imageQuality    = ImageSetting("Quality",    "AZURE_IMAGE_QUALITY", "high");
+string imageSize       = ImageSetting("Size",       "AZURE_IMAGE_SIZE",    "1024x1536");
 
-// The ActivitySource name is the wire between the AI client and OpenTelemetry: the AI
-// client *emits* spans under this name, the tracer *subscribes* to this name.
-const string aiSourceName = "LangfuseDemo.AI";
+// --- Garments ---------------------------------------------------------------------------
+string[] allGarments = config.GetSection("Garments:Images").Get<string[]>() is { Length: > 0 } list
+    ? list
+    : throw new InvalidOperationException(
+        "Set Garments:Images in appsettings.Local.json - the list of product photo names "
+        + "(without the .png extension). See README.md.");
+
+string outputDirectory = config["Garments:OutputDirectory"] is { Length: > 0 } dir ? dir : "Output";
+
+// The product photos and prompt files live in the project folder, not in bin/.
+string projectDirectory = config["Garments:SourceDirectory"] is { Length: > 0 } src
+    ? src
+    : Directory.GetCurrentDirectory();
+
+string[] garments = args.Length == 0       ? [allGarments[0]]
+                  : args.Contains("--all") ? allGarments
+                  : args.Where(a => !a.StartsWith("--")).ToArray();
+
+if (garments.Length == 0) garments = [allGarments[0]];
+
+// The ActivitySource name is the wire between this app and OpenTelemetry: we emit spans
+// under this name, the tracer provider below subscribes to it.
+const string sourceName = "LangfuseDemo.ImagePipeline";
+using var activitySource = new ActivitySource(sourceName);
 
 
 // =====================================================================================
-//  2. PROMPT: FETCHED FROM LANGFUSE  (Langfuse  ->  app)
+//  2. PROMPTS: PUSHED INTO, THEN FETCHED FROM, LANGFUSE
 // =====================================================================================
-// Plain HTTPS against the Langfuse Public API - nothing to do with OpenTelemetry.
-// Prompt management is the inbound path (Langfuse -> app); tracing in step 3 is the
-// outbound path (app -> Langfuse).
+// The .md files are only a seed. Once a prompt exists in Langfuse the UI is the source of
+// truth, and editing it there creates version 2, 3, ... with no redeploy here.
 
-var langfusePrompts = new LangfusePromptClient(langfuseBaseUrl, langfusePublicKey, langfuseSecretKey);
+var prompts = new LangfusePromptClient(langfuseBaseUrl, langfusePublicKey, langfuseSecretKey);
+
+Console.WriteLine("Prompts");
 
 if (seedPromptIfMissing)
 {
-    // One-time bootstrap so the demo works on a blank Langfuse instance. If a version
-    // already carries the "production" label, nothing is written and no version is bumped.
-    await langfusePrompts.SeedIfMissingAsync(
-        name: promptName,
+    await prompts.SeedIfMissingAsync(
+        name: frontPromptName,
         label: promptLabel,
-        template: "You are a patient teacher.\n"
-                + "Explain {{topic}} to a {{audience}} in exactly one sentence.",
-        config: new { temperature = 0.3, max_tokens = 200 },
-        commitMessage: "Seeded from LangfuseDemo");
+        template: await ReadPromptFileAsync("front_view_shot_prompt.md"),
+        config: new { size = imageSize, quality = imageQuality, shot = "front" },
+        commitMessage: "Seeded from front_view_shot_prompt.md");
+
+    await prompts.SeedIfMissingAsync(
+        name: backPromptName,
+        label: promptLabel,
+        template: await ReadPromptFileAsync("back_view_shot_prompt.md"),
+        config: new { size = imageSize, quality = imageQuality, shot = "back" },
+        commitMessage: "Seeded from back_view_shot_prompt.md");
 }
 
-// Pull the live prompt. prompt.Version is the Langfuse version number that gets stamped
-// onto the trace in step 3, so every generation is attributable to an exact version.
-LangfusePrompt prompt = await langfusePrompts.GetAsync(promptName, promptLabel);
+LangfusePrompt frontPrompt = await prompts.GetAsync(frontPromptName, promptLabel);
+LangfusePrompt backPrompt  = await prompts.GetAsync(backPromptName, promptLabel);
 
-Console.WriteLine($"Using Langfuse prompt '{prompt.Name}' v{prompt.Version} (label: {promptLabel})");
+Console.WriteLine($"  {frontPrompt.Name} v{frontPrompt.Version} (label: {promptLabel})");
+Console.WriteLine($"  {backPrompt.Name} v{backPrompt.Version} (label: {promptLabel})");
 
-// Fill the {{placeholders}} in the template Langfuse returned.
-string userMessage = prompt.Compile(
-    ("topic", "OpenTelemetry"),
-    ("audience", "junior developer"));
+// Render settings may be overridden per prompt version in Langfuse, so changing the output
+// size is a tracked prompt change rather than a config edit.
+string effectiveSize    = frontPrompt.ConfigString("size")    ?? imageSize;
+string effectiveQuality = frontPrompt.ConfigString("quality") ?? imageQuality;
 
 
 // =====================================================================================
-//  3. OPENTELEMETRY PIPELINE  (collect spans  ->  ship them to Langfuse)
+//  3. OPENTELEMETRY PIPELINE  (collect spans -> ship them to Langfuse)
 // =====================================================================================
-// Langfuse speaks OTLP over HTTP and authenticates with HTTP Basic using the same
-// public/secret key pair as the REST API above.
 
 var otelAuthHeader = Convert.ToBase64String(
     Encoding.UTF8.GetBytes($"{langfusePublicKey}:{langfuseSecretKey}"));
 
 using var tracerProvider = Sdk.CreateTracerProviderBuilder()
-
-    // Resource attributes -> shown in Langfuse as the service that produced the trace.
-    .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("langfuse-demo"))
-
-    // ---- RECEIVING THE AZURE AI FOUNDRY DATA ------------------------------------------
-    // Subscribe to the ActivitySource that the Microsoft.Extensions.AI wrapper (step 4)
-    // writes to. Each Foundry call lands here as one GenAI span carrying the model name,
-    // the request/response messages and the token usage Foundry reported.
-    .AddSource(aiSourceName)
-
-    // ---- LINKING THE LANGFUSE PROMPT VERSION TO THE SPAN -------------------------------
-    // The AI client builds the span for us and exposes no enrichment hook, so we edit the
-    // span in flight with a processor. Registered BEFORE the exporter so the tags are
-    // already on the span when the batching exporter picks it up.
-    .AddProcessor(new LangfusePromptLinkProcessor(aiSourceName, prompt.Name, prompt.Version))
-
-    // ---- SENDING TO LANGFUSE ------------------------------------------------------------
+    .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("langfuse-image-pipeline"))
+    .AddSource(sourceName)
     .AddOtlpExporter(options =>
     {
         options.Endpoint = new Uri(langfuseOtelEndpoint);
@@ -137,185 +172,193 @@ using var tracerProvider = Sdk.CreateTracerProviderBuilder()
 
 
 // =====================================================================================
-//  4. AI CLIENT  (talks to Azure AI Foundry, emits OpenTelemetry spans)
+//  4. CLIENTS
 // =====================================================================================
 
-IChatClient chatClient =
-    // ---- SOURCE OF THE DATA: AZURE AI FOUNDRY ------------------------------------------
-    // The model deployment on your Foundry resource. Everything Langfuse later displays -
-    // model name, latency, prompt/completion text, token counts, cost - originates in the
-    // HTTP response this client receives from Foundry.
-    new AzureOpenAIClient(new Uri(foundryEndpoint), new AzureKeyCredential(foundryKey))
-        .GetChatClient(deploymentName)
-        .AsIChatClient()
+var images = new AzureImageClient(
+    imageEndpoint, imageApiKey, imageApiVersion, imageDeployment, effectiveQuality, effectiveSize);
 
-        // ---- CONNECTING FOUNDRY TO OPENTELEMETRY ---------------------------------------
-        // UseOpenTelemetry wraps the Foundry client in a decorator that opens an Activity
-        // (span) around every call and fills it with the GenAI semantic-convention
-        // attributes. sourceName must match the AddSource(...) in step 3, otherwise the
-        // spans are never listened to and silently dropped.
-        .AsBuilder()
-        .UseOpenTelemetry(
-            sourceName: aiSourceName,
-            configure: c => c.EnableSensitiveData = true) // include prompt + answer text
-        .Build();
+var media = new LangfuseMediaClient(langfuseBaseUrl, langfusePublicKey, langfuseSecretKey);
+
+Directory.CreateDirectory(outputDirectory);
 
 
 // =====================================================================================
-//  5. RUN THE CALL
+//  5. RUN THE SHOOT
 // =====================================================================================
-// Foundry returns the completion -> the decorator from step 4 records it as a span ->
-// the processor from step 3 stamps the Langfuse prompt name + version on that span ->
-// the OTLP exporter ships it to Langfuse.
-
-Console.WriteLine("Asking the AI...");
-
-var response = await chatClient.GetResponseAsync(
-    userMessage,
-    new ChatOptions
-    {
-        // Model settings come from the prompt's config in Langfuse, so tuning temperature
-        // is a tracked prompt version change rather than a code change.
-        Temperature     = prompt.Temperature,
-        MaxOutputTokens = prompt.MaxTokens,
-    });
 
 Console.WriteLine();
-Console.WriteLine("AI says: " + response.Text);
+Console.WriteLine($"Model {imageDeployment}  |  {effectiveSize}  |  quality {effectiveQuality}");
+Console.WriteLine($"Garments: {string.Join(", ", garments)}");
 Console.WriteLine();
-Console.WriteLine($"Done. Open {langfuseBaseUrl} -> Tracing; the generation links back to "
-                + $"prompt '{prompt.Name}' v{prompt.Version}.");
 
-// Disposing the TracerProvider flushes anything still buffered to Langfuse.
+// One session groups every garment from this run together in the Langfuse UI.
+string sessionId = $"shoot-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+int failures = 0;
 
-
-// =====================================================================================
-//  HELPERS
-// =====================================================================================
-
-/// <summary>
-/// Copies the Langfuse prompt name and version onto every GenAI span produced by the AI
-/// client. Langfuse reads these two attributes to link the generation back to the exact
-/// prompt version, which is what powers the per-version Metrics tab on the prompt.
-/// </summary>
-sealed class LangfusePromptLinkProcessor(string aiSourceName, string promptName, int promptVersion)
-    : BaseProcessor<Activity>
+foreach (var garment in garments)
 {
-    public override void OnEnd(Activity activity)
+    try
     {
-        // Only spans emitted by the AI client are generations; leave everything else alone.
-        if (activity.Source.Name != aiSourceName)
-            return;
-
-        // Langfuse OpenTelemetry property mapping -> observation.prompt
-        activity.SetTag("langfuse.observation.prompt.name", promptName);
-        activity.SetTag("langfuse.observation.prompt.version", promptVersion);
+        await ShootAsync(garment);
+    }
+    catch (Exception ex)
+    {
+        failures++;
+        Console.WriteLine($"  FAILED: {ex.Message}");
+        Console.WriteLine();
     }
 }
 
-/// <summary>A single immutable prompt version as stored in Langfuse.</summary>
-sealed record LangfusePrompt(
-    string Name,
-    int Version,
-    string Template,
-    float? Temperature,
-    int? MaxTokens)
+Console.WriteLine("Flushing traces to Langfuse...");
+tracerProvider.ForceFlush(30_000);
+
+Console.WriteLine();
+Console.WriteLine(failures == 0
+    ? $"Done. Open {langfuseBaseUrl} -> Tracing -> session '{sessionId}'."
+    : $"Finished with {failures} failed garment(s). Open {langfuseBaseUrl} -> Tracing -> session '{sessionId}'.");
+
+return failures == 0 ? 0 : 1;
+
+
+// =====================================================================================
+//  THE PIPELINE
+// =====================================================================================
+
+async Task ShootAsync(string garment)
 {
-    /// <summary>Substitutes the {{placeholders}} in the template Langfuse returned.</summary>
-    public string Compile(params (string Key, string Value)[] variables)
+    string sourcePath = ResolveGarmentPath(garment);
+    byte[] productPhoto = await File.ReadAllBytesAsync(sourcePath);
+    string productFileName = Path.GetFileName(sourcePath);
+
+    Console.WriteLine($"{garment}  ({productPhoto.Length / 1024} KB)");
+
+    // The root span is the trace. Both generations hang off it, so Langfuse shows the front
+    // and back shot as two steps of one shoot rather than two unrelated traces.
+    using var shoot = activitySource.StartActivity("garment-shoot", ActivityKind.Internal)
+        ?? throw new InvalidOperationException(
+            "No listener for the ActivitySource - tracing is misconfigured.");
+
+    shoot.WithTraceContext($"shoot: {garment}", sessionId, "image-generation", "garment-shoot")
+         .WithMetadata("garment", garment)
+         .WithMetadata("source_image", productFileName);
+
+    string traceId = shoot.TraceId.ToHexString();
+
+    // ---- FRONT -------------------------------------------------------------------------
+    // Reference: the product photo alone.
+    var front = await GenerateAsync(
+        spanName: "front-shot",
+        prompt: frontPrompt,
+        traceId: traceId,
+        references: [new ImageInput(productFileName, "image/png", productPhoto)],
+        garment: garment);
+
+    string frontPath = Path.Combine(outputDirectory, $"{garment}_front.png");
+    await File.WriteAllBytesAsync(frontPath, front.Png);
+    Console.WriteLine($"  front -> {frontPath}");
+
+    // ---- BACK --------------------------------------------------------------------------
+    // Reference order matters: the back prompt calls the FIRST image the product photograph
+    // and the SECOND the approved front frame, so the back shot keeps the same model.
+    var back = await GenerateAsync(
+        spanName: "back-shot",
+        prompt: backPrompt,
+        traceId: traceId,
+        references:
+        [
+            new ImageInput(productFileName, "image/png", productPhoto),
+            new ImageInput($"{garment}_front.png", "image/png", front.Png),
+        ],
+        garment: garment);
+
+    string backPath = Path.Combine(outputDirectory, $"{garment}_back.png");
+    await File.WriteAllBytesAsync(backPath, back.Png);
+    Console.WriteLine($"  back  -> {backPath}");
+    Console.WriteLine();
+}
+
+// Runs one image call inside its own Langfuse generation span, with the reference images
+// attached to the input and the generated image attached to the output.
+async Task<ImageResult> GenerateAsync(
+    string spanName,
+    LangfusePrompt prompt,
+    string traceId,
+    IReadOnlyList<ImageInput> references,
+    string garment)
+{
+    using var span = activitySource.StartActivity(spanName, ActivityKind.Client)
+        ?? throw new InvalidOperationException("No listener for the ActivitySource.");
+
+    span.AsGeneration(imageDeployment)
+        .WithPrompt(prompt)
+        .WithTraceContext($"shoot: {garment}", sessionId, "image-generation", "garment-shoot")
+        .WithMetadata("garment", garment)
+        .WithMetadata("shot", spanName)
+        .WithMetadata("size", effectiveSize)
+        .WithMetadata("quality", effectiveQuality)
+        .WithMetadata("reference_images", references.Count);
+
+    string observationId = span.SpanId.ToHexString();
+
+    try
     {
-        var text = Template;
-        foreach (var (key, value) in variables)
-            text = text.Replace("{{" + key + "}}", value)
-                       .Replace("{{ " + key + " }}", value);
-        return text;
+        // Upload the reference images first so the input can point at them. Langfuse links
+        // media by id, so it does not matter that the trace has not been exported yet.
+        var inputTokens = new List<string>();
+        foreach (var reference in references)
+            inputTokens.Add(await media.UploadAsync(
+                reference.Bytes, reference.ContentType, traceId, observationId, field: "input"));
+
+        span.WithImageInput(prompt.Template, inputTokens);
+
+        Console.WriteLine($"  {spanName}: generating from {references.Count} reference image(s)...");
+        var result = await images.EditAsync(prompt.Template, references);
+
+        string outputToken = await media.UploadAsync(
+            result.Png, "image/png", traceId, observationId, field: "output");
+
+        span.WithImageOutput(outputToken)
+            .WithUsage(result.InputTokens, result.OutputTokens, result.TotalTokens);
+
+        if (result.RevisedPrompt is { Length: > 0 })
+            span.WithMetadata("revised_prompt", result.RevisedPrompt);
+
+        return result;
+    }
+    catch (Exception ex)
+    {
+        span.RecordFailure(ex);
+        throw;
     }
 }
 
-/// <summary>
-/// Minimal client for the Langfuse Prompt Management REST API (there is no official .NET
-/// SDK). Authenticates with the same key pair the OTLP exporter uses.
-/// </summary>
-sealed class LangfusePromptClient
+string ResolveGarmentPath(string garment)
 {
-    private readonly HttpClient _http;
+    string name = garment.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+        ? garment
+        : garment + ".png";
 
-    public LangfusePromptClient(string baseUrl, string publicKey, string secretKey)
+    foreach (var folder in new[] { projectDirectory, AppContext.BaseDirectory })
     {
-        _http = new HttpClient { BaseAddress = new Uri(baseUrl) };
-        _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
-            "Basic",
-            Convert.ToBase64String(Encoding.UTF8.GetBytes($"{publicKey}:{secretKey}")));
+        string candidate = Path.Combine(folder, name);
+        if (File.Exists(candidate)) return candidate;
     }
 
-    /// <summary>Gets the version of <paramref name="name"/> that carries <paramref name="label"/>.</summary>
-    public async Task<LangfusePrompt> GetAsync(string name, string label)
-        => await TryGetAsync(name, label)
-           ?? throw new InvalidOperationException(
-               $"Prompt '{name}' with label '{label}' was not found in Langfuse. Create it "
-               + "under Prompts in the Langfuse UI, or set seedPromptIfMissing = true.");
+    throw new FileNotFoundException(
+        $"Could not find the product photo '{name}'. Looked in '{projectDirectory}' and "
+        + $"'{AppContext.BaseDirectory}'. Set Garments:SourceDirectory if it lives elsewhere.");
+}
 
-    public async Task<LangfusePrompt?> TryGetAsync(string name, string label)
+async Task<string> ReadPromptFileAsync(string fileName)
+{
+    foreach (var folder in new[] { projectDirectory, AppContext.BaseDirectory })
     {
-        using var res = await _http.GetAsync(
-            $"/api/public/v2/prompts/{Uri.EscapeDataString(name)}?label={Uri.EscapeDataString(label)}");
-
-        if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
-            return null;
-
-        res.EnsureSuccessStatusCode();
-        return Parse(JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement);
+        string candidate = Path.Combine(folder, fileName);
+        if (File.Exists(candidate)) return await File.ReadAllTextAsync(candidate);
     }
 
-    /// <summary>
-    /// Creates version 1 only when no version carries the label yet. Posting again would
-    /// create a *new* version in Langfuse, so this deliberately no-ops once the prompt
-    /// exists - the Langfuse UI stays the source of truth.
-    /// </summary>
-    public async Task<LangfusePrompt> SeedIfMissingAsync(
-        string name, string label, string template, object config, string commitMessage)
-    {
-        var existing = await TryGetAsync(name, label);
-        if (existing is not null)
-            return existing;
-
-        var body = JsonSerializer.Serialize(new
-        {
-            name,
-            type = "text",
-            prompt = template,
-            labels = new[] { label },
-            config,
-            commitMessage,
-        });
-
-        using var res = await _http.PostAsync(
-            "/api/public/v2/prompts",
-            new StringContent(body, Encoding.UTF8, "application/json"));
-        res.EnsureSuccessStatusCode();
-
-        Console.WriteLine($"Created prompt '{name}' in Langfuse.");
-        return Parse(JsonDocument.Parse(await res.Content.ReadAsStringAsync()).RootElement);
-    }
-
-    private static LangfusePrompt Parse(JsonElement root)
-    {
-        float? temperature = null;
-        int? maxTokens = null;
-
-        if (root.TryGetProperty("config", out var config) && config.ValueKind == JsonValueKind.Object)
-        {
-            if (config.TryGetProperty("temperature", out var t) && t.ValueKind == JsonValueKind.Number)
-                temperature = t.GetSingle();
-            if (config.TryGetProperty("max_tokens", out var m) && m.ValueKind == JsonValueKind.Number)
-                maxTokens = m.GetInt32();
-        }
-
-        return new LangfusePrompt(
-            Name: root.GetProperty("name").GetString()!,
-            Version: root.GetProperty("version").GetInt32(),
-            Template: root.GetProperty("prompt").GetString()!,
-            Temperature: temperature,
-            MaxTokens: maxTokens);
-    }
+    throw new FileNotFoundException(
+        $"Could not find the prompt file '{fileName}'. Looked in '{projectDirectory}' and "
+        + $"'{AppContext.BaseDirectory}'.");
 }

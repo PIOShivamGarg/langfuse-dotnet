@@ -7,21 +7,24 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <!-- Config files are read from the output folder at runtime.
-       appsettings.Local.json is optional so the build still works without it (CI uses
-       environment variables instead) and it is excluded from git via .gitignore. -->
+  <!-- Config is read from the output folder at runtime. appsettings.Local.json is the only
+       settings file and is excluded from git via .gitignore, so the copy is conditional:
+       the build still works without it and CI supplies the values as environment variables
+       instead. There is no committed appsettings.json - README.md lists the keys. -->
   <ItemGroup>
-    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
     <None Update="appsettings.Local.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('appsettings.Local.json')" />
+
+    <!-- Seed text for the two Langfuse prompts. Only read on a blank Langfuse instance;
+         after that the prompt lives in Langfuse and the UI is the source of truth. -->
+    <None Update="front_view_shot_prompt.md" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="back_view_shot_prompt.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="9.0.0" />
-    <PackageReference Include="Microsoft.Extensions.AI" Version="10.11.0" />
-    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.11.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.0" />
     <PackageReference Include="OpenTelemetry" Version="1.20.1" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.20.1" />
   </ItemGroup>
